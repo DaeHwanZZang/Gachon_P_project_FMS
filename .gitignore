@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# 뷰어 저장 이미지 등 생성물
+/out/
+*.out.png
+
+# 벤더 맵 원본 포맷 — 우리 시스템은 안 읽음, 용량만 큼 (map.surfel 수십MB급)
+*.surfel
+*.clmap
+
+# OS
+.DS_Store

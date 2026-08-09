@@ -1,0 +1,13 @@
+# FMS 공통 의존성 (Python 3.11+)
+
+# 메시지 스키마 (FMS / 로봇 공유 계약)
+pydantic>=2.6
+
+# MQTT — 로봇 <-> 브로커 <-> FMS/뷰어
+paho-mqtt>=2.1
+
+# 맵 이미지 처리 + 뷰어
+Pillow>=10.0
+numpy>=1.26
+matplotlib>=3.8   # 정적 맵 확인용 구 뷰어(tools/map_viewer.py). 라이브 뷰어는 PySide6 사용
+PySide6>=6.7       # 라이브 플릿 뷰어(tools/qt_viewer.py, tools/fleet_monitor_qt.py)
