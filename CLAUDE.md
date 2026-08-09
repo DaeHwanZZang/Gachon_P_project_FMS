@@ -28,7 +28,8 @@
 
 - **로봇**은 자기 위치·속도·각도를 스스로 계산해 `state` 로 보고한다.
   FMS 도 뷰어도 이 프로세스 안을 들여다보지 않는다
-- **뷰어**(`tools/fleet_monitor.py`)는 **순수 관측자**다. 로봇을 시뮬레이션하지 않고,
+- **뷰어**(`tools/fleet_monitor_qt.py`, Qt/PySide6 — matplotlib 버전 `tools/fleet_monitor.py`
+  는 정적 확인용으로만 남아있다)는 **순수 관측자**다. 로봇을 시뮬레이션하지 않고,
   아무것도 발행하지 않는다. 화면의 모든 값은 로봇이 보고한 것이다.
   뷰어를 꺼도 로봇은 그대로 돌고, 로봇이 없으면 빈 맵만 보인다
 - **FMS**는 order 를 내려보내고 state 를 수집한다
@@ -79,6 +80,8 @@ Ubuntu Linux. 개발/실행 환경 통일.
 | 프론트엔드 | React + Vite, SVG 맵 렌더링 | 로봇 20대 이하는 SVG로 충분 |
 | 스키마 검증 | Pydantic v2 | 서버·로봇 공유 계약 |
 | 컨테이너 | Docker Compose | 로봇 다중 인스턴스 관리 |
+| 로컬 라이브 뷰어 | PySide6 (Qt) + QGraphicsView | `tools/qt_viewer.py`. FMS 대시보드(React)와는 별개, 개발용 |
+| 로봇 로컬 제어판 | Tkinter (`--gui`) | 표준 라이브러리라 로봇 컨테이너엔 영향 없음 |
 
 ---
 
@@ -115,10 +118,12 @@ project/
 │   ├── battery.py          # 충전 스케줄링
 │   └── api/                # REST + WebSocket 라우터
 ├── robot_client/
-│   ├── main.py             # ✅ CLI 진입점 (--id). 프로세스 1개 = 로봇 1대
+│   ├── main.py             # ✅ CLI 진입점 (--id, --gui). 프로세스 1개 = 로봇 1대
 │   ├── comm.py             # ✅ MQTT 송수신, LWT
-│   ├── executor.py         # ✅ 오더 해석, 상태머신, released 처리
-│   ├── clock.py            # ✅ 시계 추상화 (time.sleep 직접 호출 대신)
+│   ├── executor.py         # ✅ 오더 해석, 상태머신, released 처리, force_relocalize
+│   ├── planner.py          # ✅ A* 경로계획 (로봇 폭 반영 config-space 팽창)
+│   ├── gui.py               # ✅ 로컬 제어판 (Tk, --gui). MQTT 안 탐, 같은 프로세스 큐로 직결
+│   ├── clock.py             # ✅ 시계 추상화 (time.sleep 직접 호출 대신)
 │   └── sim/                # ⚠️ FMS/뷰어에서 절대 import 금지
 │       ├── kinematics.py   # ✅ 사다리꼴 속도 프로파일
 │       └── battery.py      # ✅ 선형 방전/충전
@@ -191,6 +196,25 @@ BATTERY_LOW → CHARGING → IDLE
 ERROR (어느 상태에서든 진입)
 ```
 
+### 경로계획은 이제 로봇 몫이다 (아키텍처 변경)
+
+> 처음엔 "FMS 가 경로를 짜서 노드 리스트로 내려준다" 였는데, 바꿨다.
+> **FMS 는 목적지 좌표만 오더로 준다. 거기까지 장애물 피해서 가는 길은
+> 로봇이 자기 맵으로 스스로 A\* 를 돌려서 짠다** (`robot_client/planner.py`).
+
+- 오더 노드는 보통 1개(목적지)다. `released`/트래픽 제어 개념 자체는 그대로 —
+  FMS 는 여전히 어느 노드까지 통행권을 줄지 결정한다. 다만 그 노드 사이를
+  "어떻게" 갈지는 이제 로봇이 정한다
+- A\* 는 로봇 몸체 크기(`--robot-width`/`--robot-length`, 기본 0.5x0.7m)만큼
+  장애물을 팽창시킨 config-space 위에서 돈다 — **로봇 폭보다 좁은 통로는
+  애초에 경로가 안 나온다**
+- 경로를 못 찾으면 `NO_PATH` FATAL 오류로 오더를 버린다 (재배정은 FMS 몫)
+- `--map` 을 안 주면 경로계획도 충돌 감지도 꺼지고 노드 사이를 직선으로만 움직인다
+  (예전 방식 그대로 — 개발 초기 호환용)
+- 로컬 좌표를 로봇 스스로 알고 있어야 시작할 수 있다. 위치추정이 틀어졌으면
+  `--gui` 제어판의 "강제 로컬라이징"으로 좌표/각도를 직접 정정한다 (경로 없이
+  좌표값 자체를 덮어씀 — 실물엔 없는 디버그 전용 기능, FMS 프로토콜에도 없음)
+
 ### 로봇이 오더를 거절하는 경우
 
 FMS 를 만들 때 이 규칙을 알고 있어야 한다. 로봇은 다음을 조용히 무시한다.
@@ -200,13 +224,10 @@ FMS 를 만들 때 이 규칙을 알고 있어야 한다. 로봇은 다음을 �
 | 같은 `order_id` 인데 `order_update_id` 가 크지 않음 | 통행권을 되돌리지 않기 위해 |
 | 이미 완료한 오더의 재전송 | QoS 1 중복·FMS 재시작 시 재실행 방지 |
 | 다른 오더 실행 중 (IDLE 아님) | 오더는 한 번에 하나 |
-| 첫 노드가 현재 위치에서 `--max-start-deviation`(기본 1m) 초과 | 로봇은 첫 노드까지 **직선**으로 간다. 멀면 선반을 관통한다 |
-
-**FMS 는 로봇이 서 있는 자리에서 시작하는 오더를 내려보내야 한다.**
 
 ### 로봇 자체 안전장치
 
-경로계획은 FMS 몫이지만, 로봇은 자기 맵으로 스스로를 지킨다 (실물이면 범퍼/라이다).
+로봇은 계획한 경로를 밟다가도 자기 맵으로 스스로를 지킨다 (실물이면 범퍼/라이다).
 
 - 주행 중 주행 불가 셀에 들어가면 **직전 위치에 멈추고** `COLLISION` FATAL 오류 → `ERROR`
   (장애물 안에 서면 어떤 오더를 받아도 첫 tick 에 또 충돌해 빠져나올 수 없다)
@@ -224,25 +245,32 @@ FMS 를 만들 때 이 규칙을 알고 있어야 한다. 로봇은 다음을 �
 - [x] MQTT 토픽 구조 설계
 - [x] `common/schemas.py` — Order / State / Connection / InstantAction
 - [x] `common/map_model.py` — occupancy grid 맵 (PNG + JSON 메타데이터), world↔pixel 변환, 셀 분류
+      (좌표계는 벤더 맵 규약에 맞춰 좌상단 원점·y 뒤집지 않음으로 통일)
 - [x] **로봇 클라이언트** — 프로세스 1개 = 로봇 1대, MQTT 접속/LWT, 오더 상태머신,
       운동학·배터리 시뮬레이션, 충돌 감지, 긴급정지·장애주입
-- [x] **뷰어/모니터** — MQTT 구독으로 로봇 N대 표시 (순수 관측자)
+- [x] **로봇 자체 경로계획** (`robot_client/planner.py`) — A\*, 로봇 폭 반영 config-space 팽창.
+      FMS 는 목적지만 준다
+- [x] **로봇 로컬 제어판** (`robot_client/gui.py`, `--gui`) — 로봇 정보 표시, 목적지 이동 명령,
+      강제 로컬라이징 (디버그 전용, MQTT 안 탐)
+- [x] **뷰어** — `tools/qt_viewer.py` + `tools/fleet_monitor_qt.py` (Qt, 라이브 기본).
+      matplotlib 버전(`tools/map_viewer.py`)은 정적 확인용으로 남김. 순수 관측자
 - [x] MQTT 브로커 로컬 구성 (`broker/mosquitto.conf`)
 - [x] `tools/send_order.py` — 임시 FMS 대역 (오더/즉시명령 발행)
+- [x] `tools/import_vendor_map.py` — 실제 AMR 벤더 맵(`grid_cfg.grid` 계열) 임포트,
+      이미지 변환 없이 메타데이터만 생성
 
 ### 다음 작업 (우선순위 순)
-1. **맵 노드/엣지 그래프** — 오더 노드용 토폴로지 JSON, networkx 변환
-   (occupancy grid 는 완료. 그 위에 주행 노드 그래프를 얹는 단계)
-   지금은 오더 좌표를 손으로 찍고 있어서, 이게 없으면 A* 를 붙일 수 없다
-2. **FMS 서버 골격** — 로봇 레지스트리, 상태 수집, order 발행
+1. **FMS 서버 골격** — 로봇 레지스트리, 상태 수집, order 발행
    (`tools/send_order.py` 가 하는 일을 제대로 하는 것)
-3. docker-compose — 브로커 + 로봇 N대 (`--scale robot=20`)
-4. A* 경로계획
-5. 작업 할당 (비용함수 기반)
-6. **트래픽 제어 — 시공간 예약** (프로젝트 핵심)
-7. 대시보드 (React)
-8. 배터리/충전 스케줄링
-9. 실험 및 성능 측정
+2. docker-compose — 브로커 + 로봇 N대 (`--scale robot=20`)
+3. 작업 할당 (비용함수 기반)
+4. **트래픽 제어 — 시공간 예약** (프로젝트 핵심). 다중 로봇 교차로 예약 단위로
+   맵 노드/엣지 그래프가 필요해지면 이 단계에서 추가
+5. 대시보드 (React)
+6. 배터리/충전 스케줄링
+7. 실험 및 성능 측정
+8. 실제 벤더 맵(`maps/641931de9eae7cecb34d5765/`)이 SLAM 노이즈가 심해서 로봇 폭
+   반영 경로계획이 대부분 실패함 — 노이즈 제거(despeckle) 전처리 필요
 
 ### 중요: 개발 순서
 로봇 클라이언트가 돌아가므로 나머지 파트는 이제 병렬로 진행할 수 있다.
@@ -310,12 +338,16 @@ mosquitto -c broker/mosquitto.conf          # macOS: brew install mosquitto
 # 2) 로봇 — 1대당 터미널 1개. 10대면 10번 실행
 .venv/bin/python -m robot_client.main --id AMR-001 --map maps/warehouse.json --x 1.2 --y 6.0
 .venv/bin/python -m robot_client.main --id AMR-002 --map maps/warehouse.json --x 1.2 --y 4.0
+# --gui 붙이면 로컬 제어판(Tk)도 같이 뜬다. --robot-width/--robot-length 로 로봇 크기 지정 (기본 0.5x0.7m)
+.venv/bin/python -m robot_client.main --id AMR-003 --map maps/warehouse.json --x 1.2 --y 2.0 --gui
 
 # 3) 뷰어 (관측 전용) — Qt 버전이 기본. matplotlib 버전은 정적 확인용으로만 남겨둠
 .venv/bin/python tools/fleet_monitor_qt.py maps/warehouse.json
 
-# 4) 오더 발행 — FMS 가 생기기 전까지 쓰는 임시 도구
-.venv/bin/python tools/send_order.py AMR-001 --path 1.2,6 1.2,2 13.4,2 --order-id O1
+# 4) 오더 발행 — FMS 가 생기기 전까지 쓰는 임시 도구. --path 는 이제 보통 목적지 1개만 준다
+#    (경유점을 여러 개 주면 예전처럼 그 사이 통행권 제어도 되지만, 각 구간 사이 장애물
+#    회피는 로봇이 알아서 A* 로 짠다)
+.venv/bin/python tools/send_order.py AMR-001 --path 13.4,2 --order-id O1
 .venv/bin/python tools/send_order.py AMR-001 --instant EMERGENCY_STOP
 ```
 
@@ -346,6 +378,10 @@ Key invariants enforced by validators (in `Order`, `TimeWindow`):
 - `OrderNode.sequence_id` must be strictly ascending, no duplicates.
 - `OrderNode.released` gates traffic control: once `released=False` appears, every following node must also be `released=False` (release is contiguous from the front — a robot never gets permission for a node past a blocked one).
 - `TimeWindow.exit` must not precede `enter`.
-- `order_update_id` is a per-`order_id` monotonic counter; robots must reject updates not greater than what they already hold — this logic lives on the (not-yet-written) robot client, `schemas.py` only carries the field.
+- `order_update_id` is a per-`order_id` monotonic counter; robots reject updates not greater than what they already hold (`OrderExecutor.accept_order`).
+
+**Path planning moved to the robot** (architecture change from the original VDA5050-style design): an `Order` now typically carries a single destination `OrderNode`, not a pre-planned waypoint list. The robot computes the obstacle-avoiding route itself via `robot_client/planner.py` (grid A*, inflated by robot footprint), and reports the resulting route back in `State.local_path` (`list[Point]`) purely for observability — nothing consumes it as input. `State` also carries `width`/`length` (the robot's own footprint) so viewers can render it accurately without out-of-band config. `released`/traffic-control semantics on `OrderNode` are unchanged — FMS still gates which nodes a robot may pass.
+
+`common/map_model.py`'s coordinate convention is **top-left origin, y increasing downward — no ROS-style flip**, chosen to match real AMR vendor grid formats (`grid_cfg.grid`: `ox/oy` + `origin_px/py` + `scale_m2px`) so vendor maps can be imported via `tools/import_vendor_map.py` without touching pixel data. `MapMetadata.origin_x/origin_y` is the world coordinate of pixel (0,0).
 
 When extending the protocol, add fields/enums to `schemas.py` rather than duplicating shapes in server/client code, and keep both sides' behavior consistent with the Korean docstrings already documenting intent (state machine in `RobotState`, action lifecycle in `ActionStatus`, error severity in `ErrorLevel`).
