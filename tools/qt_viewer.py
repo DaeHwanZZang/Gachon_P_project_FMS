@@ -26,12 +26,13 @@ from __future__ import annotations
 import math
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
 from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import (
-    QBrush, QColor, QFont, QImage, QPainterPath, QPen, QPixmap, QPolygonF,
+    QBrush, QColor, QFont, QIcon, QImage, QPainterPath, QPen, QPixmap, QPolygonF,
 )
 from PySide6.QtWidgets import (
     QGraphicsPathItem, QGraphicsPixmapItem, QGraphicsPolygonItem,
@@ -40,6 +41,8 @@ from PySide6.QtWidgets import (
 )
 
 from common.map_model import MapModel
+
+ICON_PATH = Path(__file__).resolve().parent.parent / "assets" / "icons" / "fleet_viewer_icon.png"
 
 # matplotlib 버전과 같은 팔레트를 쓴다 (일관성)
 CELL_COLORS = [QColor("#1c1c1e"), QColor("#9aa0a6"), QColor("#ffffff")]  # OCCUPIED/UNKNOWN/FREE
@@ -505,6 +508,8 @@ class FleetViewWindow(QMainWindow):
     def __init__(self, map_model: MapModel, title: str = "Fleet Viz"):
         super().__init__()
         self.setWindowTitle(title)
+        if ICON_PATH.exists():
+            self.setWindowIcon(QIcon(str(ICON_PATH)))
         self.canvas = MapCanvas(map_model)
         self.setCentralWidget(self.canvas)
         self.resize(1280, 800)

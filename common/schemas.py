@@ -56,15 +56,73 @@ class FmsMessage(BaseModel):
 # =============================================================================
 
 class RobotState(str, Enum):
-    """로봇 상태머신."""
+    """
+    로봇 상태머신. 실물 로봇 인터페이스(start/stop/emergency 버튼, auto/manual
+    토글)를 기준으로 정의했다. 다섯 값은 서로 배타적이다.
 
-    IDLE = "IDLE"                # 대기, 오더 없음
-    MOVING = "MOVING"            # 노드 간 이동 중
+        IDLE       대기. job 수신 가능
+        BUSY       job 수행 중. 세부 단계는 State.sub_state 참조
+        CHARGING   충전 중
+        ERROR      오류. 사람 개입 필요 (start 버튼 / RESET_ERROR 로 해제)
+        EMERGENCY  물리 e-stop 래치가 눌림. 래치를 다시 눌러야만 풀린다
+
+    EMERGENCY 는 다른 상태를 **덮어써서 보고하는 값**이다. 로봇 내부에서는
+    base state(IDLE/BUSY/CHARGING/ERROR)를 그대로 들고 있다가 래치가 풀리면
+    즉시 그 상태로 돌아간다 — 진행 중이던 job 도 유지된다 (PAUSE 와 동일한 동작).
+    그래서 EMERGENCY 는 errors[] 에 FATAL 로 들어가지 않는다. FATAL 로 넣으면
+    "FATAL 이면 오더를 버린다" 규칙을 타서 job 이 사라진다.
+
+    OFFLINE 은 여기 없다. 전원이 꺼진 로봇은 자기가 OFFLINE 이라고 발행할 수
+    없기 때문이다 — connection 토픽의 ConnectionState 로 브로커가 대신 알린다.
+    """
+
+    IDLE = "IDLE"
+    BUSY = "BUSY"
+    CHARGING = "CHARGING"
+    ERROR = "ERROR"
+    EMERGENCY = "EMERGENCY"
+
+
+class BusySubState(str, Enum):
+    """
+    BUSY 의 세부 단계. state == BUSY 일 때만 값이 있다.
+
+    WAITING 을 BUSY 안에 묻지 않고 따로 남긴 이유: 트래픽 제어의 데드락 감지는
+    "A 가 B 를 기다리고 B 가 A 를 기다린다" 를 봐야 하는데, BUSY 만 봐서는
+    주행 중인지 통행권 대기인지 구분할 수 없다.
+
+    실제로 움직이고 있는지 여부와는 별개다. paused / mode==MANUAL 로 정지해
+    있어도 sub_state 는 그 job 이 어느 단계에 있는지를 계속 가리킨다.
+    """
+
+    MOVING = "MOVING"            # 노드 간 이동
     WAITING = "WAITING"          # released=false 노드 앞에서 통행권 대기
-    ACTING = "ACTING"            # PICK/DROP/CHARGE 수행 중
-    CHARGING = "CHARGING"        # 충전 중
-    PAUSED = "PAUSED"            # 외부 명령으로 일시정지
-    ERROR = "ERROR"              # 오류, 사람 개입 필요
+    ACTING = "ACTING"            # PICK/DROP 수행 중 (CHARGE 는 CHARGING 상태로 빠진다)
+
+
+class OperatingMode(str, Enum):
+    """
+    로봇 패널의 auto/manual 토글 스위치.
+
+    MANUAL 이면 신규 job 을 받지 않고, 진행 중이던 job 은 일시정지한다
+    (사람이 조이스틱으로 몰고 가는 상황). AUTO 로 되돌리면 현재 위치 기준으로
+    경로를 다시 짜서 이어서 수행한다.
+    """
+
+    AUTO = "AUTO"
+    MANUAL = "MANUAL"
+
+
+class PauseSource(str, Enum):
+    """
+    일시정지를 건 주체. 사람이 손으로 세운 로봇을 원격에서 푸는 걸 막는다.
+
+        LOCAL  로봇 패널 start 버튼 / 로컬 제어판. FMS 는 이걸 풀 수 없다
+        FMS    FMS 의 PAUSE 즉시명령. FMS/로컬 양쪽 다 풀 수 있다
+    """
+
+    LOCAL = "LOCAL"
+    FMS = "FMS"
 
 
 class ActionType(str, Enum):
@@ -95,9 +153,16 @@ class ConnectionState(str, Enum):
 
 
 class InstantActionType(str, Enum):
+    """
+    FMS 가 보내는 즉시 명령.
+
+    물리 e-stop(EMERGENCY 상태)은 여기 없다 — 로봇 몸체의 래치 버튼이라 원격에서
+    누를 수도, 풀 수도 없다. FMS 가 할 수 있는 원격 정지는 PAUSE 뿐이다.
+    """
+
     CANCEL_ORDER = "CANCEL_ORDER"
-    EMERGENCY_STOP = "EMERGENCY_STOP"
-    RESUME = "RESUME"
+    PAUSE = "PAUSE"                  # 원격 일시정지 (pause_source=FMS). job 은 유지된다
+    RESUME = "RESUME"                # FMS 가 건 pause 만 풀 수 있다 (LOCAL 은 못 푼다)
     RESET_ERROR = "RESET_ERROR"
     INJECT_FAULT = "INJECT_FAULT"    # 시뮬레이터 전용: 장애 주입
 
@@ -246,6 +311,17 @@ class State(FmsMessage):
     """로봇 주기 상태 보고. FMS 가 아는 로봇의 유일한 진실."""
 
     state: RobotState
+    sub_state: Optional[BusySubState] = Field(
+        default=None, description="state == BUSY 일 때만 값이 있다. 그 외에는 반드시 None"
+    )
+    mode: OperatingMode = Field(
+        default=OperatingMode.AUTO, description="auto/manual 토글. MANUAL 이면 job 을 받지 않는다"
+    )
+    paused: bool = Field(default=False, description="일시정지 여부. job 은 유지된다")
+    pause_source: Optional[PauseSource] = Field(
+        default=None, description="일시정지를 건 주체. paused 가 True 일 때만 값이 있다"
+    )
+
     pose: Pose
     velocity: float = Field(default=0.0, description="현재 속도 m/s")
 
@@ -271,11 +347,48 @@ class State(FmsMessage):
     battery: BatteryInfo
     errors: list[ErrorInfo] = Field(default_factory=list)
 
+    @model_validator(mode="after")
+    def _check_state_consistency(self) -> "State":
+        if self.state == RobotState.BUSY and self.sub_state is None:
+            raise ValueError("state 가 BUSY 면 sub_state 가 있어야 한다")
+        if self.state != RobotState.BUSY and self.sub_state is not None:
+            raise ValueError("sub_state 는 state == BUSY 일 때만 값을 가진다")
+        if self.paused != (self.pause_source is not None):
+            raise ValueError("paused 와 pause_source 는 함께 설정돼야 한다")
+        return self
+
+    @property
+    def display_state(self) -> str:
+        """
+        사람이 읽을 상태 한 줄. 뷰어와 로봇 제어판이 같은 문자열을 쓰도록 여기 둔다.
+        축이 넷이라 값 하나만 봐서는 상황을 알 수 없다.
+
+            BUSY/MOVING
+            BUSY/WAITING (PAUSED:LOCAL)
+            EMERGENCY
+            IDLE [MANUAL]
+        """
+        label = self.state.value
+        if self.sub_state is not None:
+            label = f"{label}/{self.sub_state.value}"
+        if self.paused and self.pause_source is not None:
+            label += f" (PAUSED:{self.pause_source.value})"
+        if self.mode == OperatingMode.MANUAL:
+            label += " [MANUAL]"
+        return label
+
     @property
     def is_available(self) -> bool:
-        """새 작업을 받을 수 있는 상태인가."""
+        """
+        새 작업을 받을 수 있는 상태인가. FMS 할당기는 이 술어만 본다.
+
+        접속 여부(ConnectionState)는 다른 토픽이라 여기 없다 — FMS 가 이 값과
+        connection 을 함께 보고 최종 판단한다.
+        """
         return (
             self.state == RobotState.IDLE
+            and self.mode == OperatingMode.AUTO
+            and not self.paused
             and self.order_id is None
             and not any(e.level == ErrorLevel.FATAL for e in self.errors)
         )

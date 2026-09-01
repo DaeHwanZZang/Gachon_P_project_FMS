@@ -5,10 +5,26 @@
 오더를 받아 노드를 순서대로 처리하고, 매 tick 마다 State 스냅샷을 만든다.
 운동학·배터리 시뮬레이션을 소유하지만, 밖에서 보면 그냥 "로봇이 하는 일" 이다.
 
-    IDLE ─(order)→ MOVING ─(도착)→ ACTING ─(완료)→ MOVING ...
-                     │                            └→ IDLE
-                     └─(released:false)→ WAITING
-    ERROR (어느 상태에서든 진입)
+    IDLE ─(order)→ BUSY/MOVING ─(도착)→ BUSY/ACTING ─(완료)→ BUSY/MOVING ...
+                        │                                  └→ IDLE
+                        ├─(released:false)→ BUSY/WAITING
+                        └─(CHARGE 액션)───→ CHARGING ─(완료)→ IDLE
+    ERROR (어느 상태에서든 진입. FATAL 이면 오더를 버린다)
+
+상태 축이 네 개다 — 하나의 enum 에 뭉치지 않는다
+--------------------------------------------
+    base_state   IDLE / BUSY / CHARGING / ERROR      배타적 상태머신
+    estop_latched  물리 e-stop 래치가 눌렸는가        보고할 땐 EMERGENCY 로 덮어씀
+    paused       start 버튼 / FMS PAUSE              job 유지한 채 정지
+    mode         AUTO / MANUAL                        MANUAL 이면 job 안 받고 정지
+
+e-stop 과 pause 는 base_state 를 건드리지 않는다. 그래서 "풀면 원래 상태로
+복귀" 에 저장/복원 로직이 필요 없다 — 애초에 안 바꿨으니 그냥 그대로다.
+job 도 유지된다. 다만 정지 중에 위치가 노드 사이일 수 있으므로, 풀릴 때
+현재 위치 기준으로 A* 를 다시 돌린다 (_resume_motion).
+
+ERROR 는 다르다. FATAL 오류는 오더를 버리고 (raise_fatal), 사람이 start 버튼이나
+FMS 의 RESET_ERROR 로 풀어야 IDLE 로 돌아간다. 재배정은 FMS 몫이다.
 
 released 처리 — 트래픽 제어의 핵심
 ---------------------------------
@@ -36,13 +52,17 @@ from common.schemas import (
     Action,
     ActionProgress,
     ActionStatus,
+    ActionType,
+    BusySubState,
     ErrorInfo,
     ErrorLevel,
     InstantAction,
     InstantActionType,
     NodeProgress,
+    OperatingMode,
     Order,
     OrderNode,
+    PauseSource,
     Point,
     Pose,
     RobotState,
@@ -91,7 +111,15 @@ class OrderExecutor:
         )
         self.battery = battery or BatterySim(max_velocity=max_velocity)
 
-        self.state = RobotState.IDLE
+        # 배타적 상태머신. EMERGENCY 는 여기 안 들어간다 (state 프로퍼티가 덮어씀)
+        self.base_state = RobotState.IDLE
+        self.sub_state: Optional[BusySubState] = None
+        # 직교 축들 — base_state 를 건드리지 않고 주행만 억제한다
+        self.estop_latched = False
+        self.paused = False
+        self.pause_source: Optional[PauseSource] = None
+        self.mode = OperatingMode.AUTO
+
         self.errors: list[ErrorInfo] = []
 
         self.order_id: Optional[str] = None
@@ -110,7 +138,150 @@ class OrderExecutor:
         self._acting: Optional[Action] = None
         self._acting_elapsed: float = 0.0
         self._action_states: dict[str, ActionStatus] = {}
-        self._paused = False
+
+    # -- 상태 조회 --------------------------------------------------------
+
+    @property
+    def state(self) -> RobotState:
+        """밖에 보고하는 상태. e-stop 래치가 눌렸으면 무조건 EMERGENCY 다."""
+        if self.estop_latched:
+            return RobotState.EMERGENCY
+        return self.base_state
+
+    @property
+    def motion_inhibited(self) -> bool:
+        """주행 억제 조건. 하나라도 참이면 안 움직인다. job 은 유지된다."""
+        return (
+            self.estop_latched
+            or self.paused
+            or self.mode == OperatingMode.MANUAL
+            or self.base_state == RobotState.ERROR
+        )
+
+    @property
+    def can_accept_job(self) -> bool:
+        """신규 job 을 받을 수 있는가. State.is_available 과 같은 조건이다."""
+        return (
+            self.state == RobotState.IDLE
+            and self.mode == OperatingMode.AUTO
+            and not self.paused
+            and self.order_id is None
+            and not any(e.level == ErrorLevel.FATAL for e in self.errors)
+        )
+
+    def _set_base(self, state: RobotState) -> None:
+        self.base_state = state
+        self.sub_state = None
+
+    def _set_busy(self, sub: BusySubState) -> None:
+        self.base_state = RobotState.BUSY
+        self.sub_state = sub
+
+    # -- 물리 패널 (실물 로봇 인터페이스 재현) ------------------------------
+
+    def press_start(self) -> str:
+        """
+        start 버튼. 한 버튼이 세 가지 일을 하므로 우선순위가 고정돼 있다.
+        무엇을 했는지 문자열로 돌려준다 (제어판 표시용).
+        """
+        if self.estop_latched:
+            log.warning("[%s] start 무시: e-stop 래치를 먼저 풀어야 한다", self.robot_id)
+            return "e-stop 래치를 먼저 푸세요"
+        if self.base_state == RobotState.ERROR:
+            self.reset_error()
+            return "오류 해제"
+        if self.paused:
+            self.resume(PauseSource.LOCAL)
+            return "일시정지 해제"
+        self.pause(PauseSource.LOCAL)
+        return "일시정지"
+
+    def press_stop(self) -> str:
+        """stop 버튼. 실물 패널에 있지만 기능이 할당돼 있지 않다 (더미)."""
+        log.debug("[%s] stop 버튼 (기능 없음)", self.robot_id)
+        return "stop 버튼은 기능이 없습니다"
+
+    def set_estop(self, latched: bool) -> None:
+        """
+        물리 e-stop 래치. 누르면 눌린 채 유지되고, 다시 눌러야 풀린다.
+
+        base_state 를 건드리지 않으므로 풀면 하던 job 을 그대로 이어서 한다
+        (PAUSE 와 동일한 동작). 별도 리셋 버튼은 필요 없다.
+        """
+        if latched == self.estop_latched:
+            return
+        self.estop_latched = latched
+        if latched:
+            self.kinematics.emergency_stop()
+            log.warning("[%s] e-stop 래치 눌림 — 즉시 정지 (job %s 유지)",
+                        self.robot_id, self.order_id)
+        else:
+            log.info("[%s] e-stop 래치 해제 — %s 로 복귀", self.robot_id, self.base_state.value)
+            self._resume_motion()
+
+    def toggle_estop(self) -> bool:
+        """래치 토글. 새 래치 상태를 돌려준다."""
+        self.set_estop(not self.estop_latched)
+        return self.estop_latched
+
+    def set_mode(self, mode: OperatingMode) -> None:
+        """
+        auto/manual 토글 스위치.
+
+        MANUAL 로 가면 job 을 유지한 채 정지한다 (사람이 조이스틱으로 몰고 가는
+        상황). AUTO 로 돌아오면 **현재 위치 기준으로** A* 를 다시 돌려 이어서 한다 —
+        사람이 로봇을 옮겨놨을 수 있으므로 예전 경로는 그대로 쓸 수 없다.
+        """
+        if mode == self.mode:
+            return
+        self.mode = mode
+        if mode == OperatingMode.MANUAL:
+            self.kinematics.emergency_stop()
+            log.info("[%s] MANUAL 전환 — 주행 정지 (job %s 유지)", self.robot_id, self.order_id)
+        else:
+            log.info("[%s] AUTO 전환 — 현재 위치 기준 경로 재계획", self.robot_id)
+            self._resume_motion()
+
+    def pause(self, source: PauseSource) -> bool:
+        """일시정지. job 은 유지된다."""
+        if self.paused:
+            return False
+        self.paused = True
+        self.pause_source = source
+        self.kinematics.emergency_stop()
+        log.info("[%s] 일시정지 (%s)", self.robot_id, source.value)
+        return True
+
+    def resume(self, by: PauseSource) -> bool:
+        """
+        일시정지 해제. **로컬이 상위다** — 사람이 손으로 세운 로봇(LOCAL)을
+        FMS 가 원격에서 푸는 건 막는다. 로컬은 FMS 가 건 것도 풀 수 있다.
+        """
+        if not self.paused:
+            return False
+        if by == PauseSource.FMS and self.pause_source == PauseSource.LOCAL:
+            log.warning("[%s] FMS 의 재개 거절: 로컬에서 건 일시정지다", self.robot_id)
+            return False
+        self.paused = False
+        self.pause_source = None
+        log.info("[%s] 일시정지 해제 (%s)", self.robot_id, by.value)
+        self._resume_motion()
+        return True
+
+    def reset_error(self) -> None:
+        """오류 초기화. FATAL 이었으면 오더는 이미 버려졌으므로 IDLE 로 간다."""
+        self.errors.clear()
+        if self.base_state == RobotState.ERROR:
+            self._set_base(RobotState.IDLE)
+            self._resume_motion()
+
+    def _resume_motion(self) -> None:
+        """주행 억제가 풀렸을 때 현재 위치 기준으로 경로를 다시 짠다."""
+        if self.motion_inhibited:
+            return                       # 다른 억제 조건이 아직 남아 있다
+        if self._acting is not None:
+            return                       # 액션 수행 중이면 밟을 경로가 없다
+        self._replan()
 
     # -- 오더 수신 --------------------------------------------------------
 
@@ -134,10 +305,13 @@ class OrderExecutor:
                 return False
             return self._apply_order_update(order)
 
-        if self.order_id is not None and self.state != RobotState.IDLE:
+        # 신규 오더는 job 수락 조건을 전부 만족해야 받는다. (같은 order_id 의 갱신은
+        # 위에서 이미 처리했다 — 통행권 해제는 정지 중에도 받아야 하므로 막지 않는다)
+        if not self.can_accept_job:
             log.warning(
-                "[%s] 다른 오더 실행 중이라 %s 거절 (진행 중: %s)",
-                self.robot_id, order.order_id, self.order_id,
+                "[%s] 오더 %s 거절: state=%s mode=%s paused=%s 진행중=%s",
+                self.robot_id, order.order_id, self.state.value, self.mode.value,
+                self.paused, self.order_id,
             )
             return False
 
@@ -149,12 +323,13 @@ class OrderExecutor:
             n.action.action_id: ActionStatus.WAITING for n in self.nodes if n.action
         }
         self._acting = None
-        self._replan()
+        # 경로계획이 실패하면 _replan 이 오더를 버리므로(raise_fatal), 수신 로그를 먼저 남긴다
         log.info(
             "[%s] 오더 수신 %s update=%d, 노드 %d개 (released %d개)",
             self.robot_id, order.order_id, order.order_update_id,
             len(self.nodes), sum(1 for n in self.nodes if n.released),
         )
+        self._replan()
         return True
 
     def _apply_order_update(self, order: Order) -> bool:
@@ -186,21 +361,13 @@ class OrderExecutor:
         if kind == InstantActionType.CANCEL_ORDER:
             log.info("[%s] 오더 취소: %s", self.robot_id, self.order_id)
             self._clear_order()
-        elif kind == InstantActionType.EMERGENCY_STOP:
-            log.warning("[%s] 긴급정지", self.robot_id)
-            self._paused = True
-            self.kinematics.emergency_stop()
-            self.state = RobotState.PAUSED
+        elif kind == InstantActionType.PAUSE:
+            self.pause(PauseSource.FMS)
         elif kind == InstantActionType.RESUME:
-            log.info("[%s] 재개", self.robot_id)
-            self._paused = False
-            self._replan()
+            self.resume(PauseSource.FMS)
         elif kind == InstantActionType.RESET_ERROR:
             log.info("[%s] 오류 초기화", self.robot_id)
-            self.errors.clear()
-            if self.state == RobotState.ERROR:
-                # FATAL 이 나면 오더는 이미 버려졌다. 새 오더를 받을 수 있는 상태로 돌아간다
-                self.state = RobotState.IDLE if self.order_id is None else RobotState.MOVING
+            self.reset_error()
         elif kind == InstantActionType.INJECT_FAULT:
             fault = str(action.params.get("fault", "UNKNOWN_FAULT"))
             log.warning("[%s] 장애 주입: %s (오더 %s 중단)", self.robot_id, fault, self.order_id)
@@ -211,7 +378,10 @@ class OrderExecutor:
     # -- 매 tick ----------------------------------------------------------
 
     def tick(self, dt: float) -> None:
-        if self.state == RobotState.ERROR or self._paused:
+        # e-stop / 일시정지 / MANUAL / ERROR — 서 있기만 한다. base_state 도 job 도
+        # 그대로 두므로, 억제가 풀리면 하던 자리에서 이어서 한다.
+        # 충전 중이면 배터리는 계속 찬다 (전원선은 꽂혀 있다)
+        if self.motion_inhibited:
             self.battery.step(dt, velocity=0.0)
             return
 
@@ -221,7 +391,7 @@ class OrderExecutor:
             return
 
         if self.order_id is None:
-            self.state = RobotState.IDLE
+            self._set_base(RobotState.IDLE)
             self.battery.step(dt, velocity=0.0)
             return
 
@@ -234,14 +404,16 @@ class OrderExecutor:
 
         # 다음 노드에 통행권이 없으면 여기서 대기
         if not self.nodes[self.current_index].released:
-            self.state = RobotState.WAITING
+            self._set_busy(BusySubState.WAITING)
             self.battery.step(dt, velocity=0.0)
             return
 
         if not self._segment:
             self._replan()
             if not self._segment:
-                self.state = RobotState.WAITING
+                # 경로계획이 실패했으면 _replan 이 이미 ERROR 로 보냈다. 덮어쓰지 않는다
+                if self.base_state != RobotState.ERROR:
+                    self._set_busy(BusySubState.WAITING)
                 self.battery.step(dt, velocity=0.0)
                 return
 
@@ -256,7 +428,7 @@ class OrderExecutor:
         if self.kinematics.is_path_complete:
             self._on_segment_arrived()
         else:
-            self.state = RobotState.MOVING
+            self._set_busy(BusySubState.MOVING)
 
     def _check_collision(self, x: float, y: float, prev_x: float, prev_y: float) -> bool:
         """
@@ -292,10 +464,15 @@ class OrderExecutor:
         self.errors.append(error)
         self.kinematics.emergency_stop()
         self._clear_order()
-        self.state = RobotState.ERROR
+        self._set_base(RobotState.ERROR)
 
     def _tick_action(self, dt: float) -> None:
-        self.state = RobotState.ACTING
+        # CHARGE 는 ACTING 을 건너뛰고 바로 CHARGING 최상위 상태로 간다
+        if self._acting.action_type == ActionType.CHARGE:
+            self._set_base(RobotState.CHARGING)
+        else:
+            self._set_busy(BusySubState.ACTING)
+
         self._acting_elapsed += dt
         if self._acting_elapsed < self._acting.duration:
             return
@@ -304,6 +481,7 @@ class OrderExecutor:
                  self.robot_id, self._acting.action_id, self._acting.action_type.value)
         self._acting = None
         self._acting_elapsed = 0.0
+        self.battery.charging = False
         self._replan()
 
     # -- 내부: 경로 계획 ---------------------------------------------------
@@ -311,7 +489,7 @@ class OrderExecutor:
     def _replan(self) -> None:
         """current_index 부터 멈춰야 하는 지점까지를 주행 구간으로 잡는다."""
         self._segment = []
-        if self._paused or self.order_id is None:
+        if self.motion_inhibited or self.order_id is None:
             self.kinematics.set_path([])
             return
 
@@ -389,19 +567,23 @@ class OrderExecutor:
             self._acting = node.action
             self._acting_elapsed = 0.0
             self._action_states[node.action.action_id] = ActionStatus.RUNNING
-            self.state = RobotState.ACTING
+            if node.action.action_type == ActionType.CHARGE:
+                # 충전소에 도착했다. ACTING 을 거치지 않고 바로 CHARGING 으로 간다
+                self._set_base(RobotState.CHARGING)
+                self.battery.charging = True
+            else:
+                self._set_busy(BusySubState.ACTING)
             log.info("[%s] 액션 시작: %s (%s, %.1fs)", self.robot_id,
                      node.action.action_id, node.action.action_type.value, node.action.duration)
             return
 
         self._replan()
-        if not self._segment:
+        if not self._segment and self.base_state != RobotState.ERROR:
             # 더 갈 곳이 없다. 오더가 끝났거나 통행권 대기
-            self.state = (
-                RobotState.WAITING
-                if self.current_index < len(self.nodes)
-                else RobotState.IDLE
-            )
+            if self.current_index < len(self.nodes):
+                self._set_busy(BusySubState.WAITING)
+            else:
+                self._set_base(RobotState.IDLE)
 
     def _clear_order(self) -> None:
         self.order_id = None
@@ -413,7 +595,8 @@ class OrderExecutor:
         self._acting_elapsed = 0.0
         self._action_states = {}
         self.kinematics.set_path([])
-        self.state = RobotState.IDLE
+        self.battery.charging = False
+        self._set_base(RobotState.IDLE)
 
     def force_relocalize(self, x: float, y: float, theta: float = 0.0) -> bool:
         """
@@ -444,6 +627,13 @@ class OrderExecutor:
             timestamp=timestamp,
             robot_id=self.robot_id,
             state=self.state,
+            # sub_state 는 state == BUSY 일 때만 유효하다 (스키마 검증). e-stop 으로
+            # EMERGENCY 를 보고하는 동안에는 비운다 — 무엇을 하던 중이었는지는
+            # order_id / node_states 에 그대로 남아 있다
+            sub_state=self.sub_state if self.state == RobotState.BUSY else None,
+            mode=self.mode,
+            paused=self.paused,
+            pause_source=self.pause_source,
             pose=Pose(x=round(k.x, 4), y=round(k.y, 4), theta=round(k.theta, 4)),
             velocity=round(k.velocity, 4),
             width=self.robot_width,

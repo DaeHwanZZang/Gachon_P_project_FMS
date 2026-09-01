@@ -66,22 +66,26 @@ class RobotComm:
         self._header_id = 0
         self._connected = False
 
-        self._client = mqtt.Client(
+        self._client = self._build_client()
+
+    def _build_client(self) -> mqtt.Client:
+        client = mqtt.Client(
             mqtt.CallbackAPIVersion.VERSION2,
-            client_id=f"robot-{robot_id}",
+            client_id=f"robot-{self.robot_id}",
             clean_session=True,
         )
-        self._client.on_connect = self._on_connect
-        self._client.on_disconnect = self._on_disconnect
-        self._client.on_message = self._on_message
+        client.on_connect = self._on_connect
+        client.on_disconnect = self._on_disconnect
+        client.on_message = self._on_message
 
         # 프로세스가 강제 종료되면 브로커가 대신 이걸 발행한다 (docker stop 장애 주입)
-        self._client.will_set(
-            topic_connection(robot_id),
+        client.will_set(
+            topic_connection(self.robot_id),
             self._connection_payload(ConnectionState.CONNECTION_BROKEN),
             qos=QOS_CONTROL,
             retain=True,
         )
+        return client
 
     # -- 접속 ------------------------------------------------------------
 
@@ -89,6 +93,34 @@ class RobotComm:
         """브로커에 접속하고 네트워크 스레드를 띄운다."""
         self._client.connect(self.host, self.port, self.keepalive)
         self._client.loop_start()
+
+    def rebind_id(self, new_robot_id: str) -> None:
+        """로봇 ID 를 바꾸고 새 토픽으로 재접속한다 (GUI 설정 변경 전용, IDLE 일 때만 호출할 것).
+
+        LWT 는 최초 CONNECT 패킷에 실려야 브로커에 등록되므로, 이미 접속된
+        세션의 will 을 그냥 덮어쓸 수 없다 — 옛 세션을 OFFLINE 으로 정리하고
+        새 client_id/LWT 로 통째로 재접속한다.
+        """
+        if new_robot_id == self.robot_id:
+            return
+        old_id = self.robot_id
+        try:
+            info = self._client.publish(
+                topic_connection(old_id),
+                self._connection_payload(ConnectionState.OFFLINE),
+                qos=QOS_CONTROL,
+                retain=True,
+            )
+            info.wait_for_publish(timeout=2.0)
+        except Exception as e:
+            log.warning("[%s] ID 변경 중 OFFLINE 발행 실패: %s", old_id, e)
+        self._client.loop_stop()
+        self._client.disconnect()
+
+        self.robot_id = new_robot_id
+        self._client = self._build_client()
+        self.connect()
+        log.info("[%s] ID 변경 완료 (이전: %s)", new_robot_id, old_id)
 
     def disconnect(self) -> None:
         """정상 종료. OFFLINE 을 남기고 끊는다 (LWT 는 발행되지 않는다)."""

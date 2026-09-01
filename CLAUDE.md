@@ -173,7 +173,7 @@ VDA5050 규격을 참고해 단순화. 상세는 `common/schemas.py` 참조.
 fms/v1/{robot_id}/connection   Robot -> FMS   LWT, retain=True
 fms/v1/{robot_id}/state        Robot -> FMS   200ms 주기
 fms/v1/{robot_id}/order        FMS -> Robot   작업 지시서
-fms/v1/{robot_id}/instant      FMS -> Robot   긴급정지, 장애주입
+fms/v1/{robot_id}/instant      FMS -> Robot   원격 일시정지, 오더 취소, 장애주입
 ```
 
 ### 핵심 메커니즘: `released` 필드
@@ -181,20 +181,84 @@ fms/v1/{robot_id}/instant      FMS -> Robot   긴급정지, 장애주입
 트래픽 제어는 **정지 명령이 아니라 통행권 부여**로 구현한다.
 
 - FMS는 안전이 확보된 노드만 `released: true` 로 내려보낸다
-- 로봇은 `released: false` 노드 직전에서 스스로 멈추고 `WAITING` 상태가 된다
+- 로봇은 `released: false` 노드 직전에서 스스로 멈추고 `BUSY/WAITING` 이 된다
 - 통행권이 생기면 FMS가 `order_update_id` 를 올려 같은 오더를 재발행
 - **메시지가 유실돼도 로봇은 안전한 쪽(정지)에 머무른다**
 - 규칙: `released` 는 노드 목록 앞에서부터 연속으로 true (스키마에서 검증)
 
 ### 상태머신 (로봇)
 
+실물 로봇 인터페이스(start/stop/emergency 버튼 + auto/manual 토글)를 기준으로 정의했다.
+**축이 네 개다. 하나의 enum 에 뭉치지 않는다** — 그러면 "BUSY 인데 PAUSE" 같은
+조합을 표현할 수 없다.
+
 ```
-IDLE ─(order)→ MOVING ─(도착)→ ACTING ─(완료)→ MOVING ...
-                 │                            └→ IDLE
-                 └─(released:false)→ WAITING
-BATTERY_LOW → CHARGING → IDLE
-ERROR (어느 상태에서든 진입)
+state       IDLE | BUSY | CHARGING | ERROR | EMERGENCY     배타적
+sub_state   MOVING | WAITING | ACTING                      state == BUSY 일 때만
+mode        AUTO | MANUAL                                  토글 스위치
+paused      bool + pause_source(LOCAL | FMS)               start 버튼 / FMS PAUSE
 ```
+
+`connection` 은 별도 토픽이다. **OFFLINE 은 `state` 값이 아니다** — 전원이 꺼진
+로봇은 자기가 OFFLINE 이라고 발행할 수 없다. 브로커가 LWT 로 대신 알린다.
+
+```
+IDLE ─(order)→ BUSY/MOVING ─(도착)→ BUSY/ACTING ─(완료)→ BUSY/MOVING ...
+                    │                                   └→ IDLE
+                    ├─(released:false)→ BUSY/WAITING
+                    └─(CHARGE 액션)───→ CHARGING ─(완료)→ IDLE
+ERROR      어느 상태에서든 진입. FATAL 이면 오더를 버린다
+EMERGENCY  e-stop 래치가 눌린 동안 위 상태를 덮어써서 보고
+```
+
+**주행 억제 조건** — 넷 중 하나라도 참이면 안 움직인다. job 은 유지된다.
+
+```
+state == EMERGENCY  or  state == ERROR  or  paused  or  mode == MANUAL
+```
+
+**job 수락 조건** (`State.is_available` / `OrderExecutor.can_accept_job`)
+
+```
+state == IDLE and mode == AUTO and not paused
+  and order_id is None and errors 에 FATAL 없음
+```
+
+#### EMERGENCY 와 PAUSE 는 base state 를 건드리지 않는다
+
+둘 다 `base_state` 를 그대로 둔 채 주행만 막는다. 그래서 **"풀면 원래 상태로
+복귀"에 저장/복원 로직이 없다** — 애초에 안 바꿨으니 그냥 그대로다. job 도 유지된다.
+
+```
+IDLE ─(e-stop)→ EMERGENCY ─(래치 해제)→ IDLE
+BUSY ─(e-stop)→ EMERGENCY ─(래치 해제)→ BUSY  (하던 job 이어서)
+```
+
+다만 정지 지점이 노드 사이일 수 있으므로, 풀릴 때 **현재 위치 기준으로 A\* 를
+다시 돌린다**. MANUAL 도 마찬가지 — 사람이 로봇을 딴 데로 몰고 갔을 수 있으니
+AUTO 복귀 시 경로를 새로 짠다.
+
+ERROR 는 다르다. FATAL 은 오더를 버리고, start 버튼이나 FMS 의 `RESET_ERROR` 로
+풀어야 IDLE 로 돌아간다. 재배정은 FMS 몫이다.
+
+#### 물리 패널 4개 (`--gui` 제어판이 재현한다)
+
+| 버튼 | 동작 |
+|---|---|
+| **start** | 우선순위 고정: `e-stop 눌림 → 무시` / `ERROR → 오류 해제` / `paused → 해제` / `그 외 → paused 설정(LOCAL)` |
+| **stop** | 기능 없음 (더미). 실물 패널에 있어서 재현만 |
+| **emergency** | 래치형. 누르면 눌린 채 유지, 다시 눌러야 해제. 즉시 정지, job 유지 |
+| **auto/manual** | MANUAL 이면 job 안 받고 주행 정지. AUTO 복귀 시 재계획 후 이어서 |
+
+#### pause 는 출처를 기억한다 — 로컬이 상위
+
+| 건 주체 | `pause_source` | FMS 가 해제 | 로컬 제어판이 해제 |
+|---|---|---|---|
+| start 버튼 / 제어판 | `LOCAL` | ✗ | ✓ |
+| FMS 의 `PAUSE` 즉시명령 | `FMS` | ✓ | ✓ |
+
+사람이 손으로 세운 로봇을 원격에서 푸는 건 막는다. 물리 e-stop 은 아예 원격
+제어 대상이 아니다 — 그래서 `InstantActionType` 에 e-stop 이 없고 `PAUSE` 만 있다.
 
 ### 경로계획은 이제 로봇 몫이다 (아키텍처 변경)
 
@@ -223,7 +287,13 @@ FMS 를 만들 때 이 규칙을 알고 있어야 한다. 로봇은 다음을 �
 |---|---|
 | 같은 `order_id` 인데 `order_update_id` 가 크지 않음 | 통행권을 되돌리지 않기 위해 |
 | 이미 완료한 오더의 재전송 | QoS 1 중복·FMS 재시작 시 재실행 방지 |
-| 다른 오더 실행 중 (IDLE 아님) | 오더는 한 번에 하나 |
+| `state != IDLE` (BUSY/CHARGING/ERROR/EMERGENCY) | 오더는 한 번에 하나 |
+| `mode == MANUAL` | 사람이 조이스틱으로 몰고 있다 |
+| `paused == True` | 세워둔 로봇에 일을 주지 않는다 |
+
+**예외: 같은 `order_id` 의 갱신은 정지 중에도 받는다.** e-stop/pause/MANUAL 로 서
+있어도 `order_update_id` 를 올린 재발행은 수용한다 — 안 그러면 로봇이 정지한 사이
+트래픽 통행권을 열어줄 수 없다. 받아만 두고 실제 주행은 억제가 풀린 뒤에 한다.
 
 ### 로봇 자체 안전장치
 
@@ -247,11 +317,14 @@ FMS 를 만들 때 이 규칙을 알고 있어야 한다. 로봇은 다음을 �
 - [x] `common/map_model.py` — occupancy grid 맵 (PNG + JSON 메타데이터), world↔pixel 변환, 셀 분류
       (좌표계는 벤더 맵 규약에 맞춰 좌상단 원점·y 뒤집지 않음으로 통일)
 - [x] **로봇 클라이언트** — 프로세스 1개 = 로봇 1대, MQTT 접속/LWT, 오더 상태머신,
-      운동학·배터리 시뮬레이션, 충돌 감지, 긴급정지·장애주입
+      운동학·배터리 시뮬레이션, 충돌 감지, 원격 일시정지·장애주입
 - [x] **로봇 자체 경로계획** (`robot_client/planner.py`) — A\*, 로봇 폭 반영 config-space 팽창.
       FMS 는 목적지만 준다
-- [x] **로봇 로컬 제어판** (`robot_client/gui.py`, `--gui`) — 로봇 정보 표시, 목적지 이동 명령,
-      강제 로컬라이징 (디버그 전용, MQTT 안 탐)
+- [x] **로봇 상태 모델** — `RobotState`(IDLE/BUSY/CHARGING/ERROR/EMERGENCY) + `BusySubState`
+      + `OperatingMode`(AUTO/MANUAL) + `paused`/`pause_source`. 실물 패널 버튼 동작 기준
+- [x] **로봇 로컬 제어판** (`robot_client/gui.py`, `--gui`) — 실물 없는 동안 그 자리를 대신하는
+      개발 툴. 물리 패널 재현(start/stop/e-stop 래치/auto-manual) + 정보 표시 + 설정 변경
+      + 목적지 이동 명령 + 강제 로컬라이징 (디버그 전용, MQTT 안 탐)
 - [x] **뷰어** — `tools/qt_viewer.py` + `tools/fleet_monitor_qt.py` (Qt, 라이브 기본).
       matplotlib 버전(`tools/map_viewer.py`)은 정적 확인용으로 남김. 순수 관측자
 - [x] MQTT 브로커 로컬 구성 (`broker/mosquitto.conf`)
@@ -338,7 +411,8 @@ mosquitto -c broker/mosquitto.conf          # macOS: brew install mosquitto
 # 2) 로봇 — 1대당 터미널 1개. 10대면 10번 실행
 .venv/bin/python -m robot_client.main --id AMR-001 --map maps/warehouse.json --x 1.2 --y 6.0
 .venv/bin/python -m robot_client.main --id AMR-002 --map maps/warehouse.json --x 1.2 --y 4.0
-# --gui 붙이면 로컬 제어판(Tk)도 같이 뜬다. --robot-width/--robot-length 로 로봇 크기 지정 (기본 0.5x0.7m)
+# --gui 붙이면 로컬 제어판(Tk)도 같이 뜬다 — 실물 패널(start/stop/e-stop/auto-manual) 재현 포함
+# --robot-width/--robot-length 로 로봇 크기 지정 (기본 0.5x0.7m)
 .venv/bin/python -m robot_client.main --id AMR-003 --map maps/warehouse.json --x 1.2 --y 2.0 --gui
 
 # 3) 뷰어 (관측 전용) — Qt 버전이 기본. matplotlib 버전은 정적 확인용으로만 남겨둠
@@ -348,7 +422,8 @@ mosquitto -c broker/mosquitto.conf          # macOS: brew install mosquitto
 #    (경유점을 여러 개 주면 예전처럼 그 사이 통행권 제어도 되지만, 각 구간 사이 장애물
 #    회피는 로봇이 알아서 A* 로 짠다)
 .venv/bin/python tools/send_order.py AMR-001 --path 13.4,2 --order-id O1
-.venv/bin/python tools/send_order.py AMR-001 --instant EMERGENCY_STOP
+#    물리 e-stop 은 원격 명령이 없다 (로봇 몸체의 래치 버튼). FMS 가 쓰는 원격 정지는 PAUSE
+.venv/bin/python tools/send_order.py AMR-001 --instant PAUSE
 ```
 
 기타:
@@ -370,7 +445,7 @@ MQTT topics (`fms/v1/{robot_id}/...`), built via helpers in `schemas.py` (`topic
 - `connection` — Robot -> FMS, retained + LWT. Broker auto-publishes `CONNECTION_BROKEN` if the robot process dies uncleanly.
 - `state` — Robot -> FMS, periodic (200ms). The `State` message is described as "FMS's only truth about the robot" — don't invent side channels for robot status.
 - `order` — FMS -> Robot, the task/route instruction.
-- `instant` — FMS -> Robot, out-of-band commands (e-stop, cancel, fault injection) independent of any order.
+- `instant` — FMS -> Robot, out-of-band commands (remote pause/resume, cancel, error reset, fault injection) independent of any order. The physical e-stop is deliberately **not** here — it is a latching button on the robot body, so it cannot be pressed or released remotely.
 
 All messages inherit `FmsMessage` (version, monotonic `header_id`, `timestamp`, `robot_id`) and use `extra="forbid"` — typo'd fields raise `ValidationError` instead of silently passing.
 
@@ -379,6 +454,11 @@ Key invariants enforced by validators (in `Order`, `TimeWindow`):
 - `OrderNode.released` gates traffic control: once `released=False` appears, every following node must also be `released=False` (release is contiguous from the front — a robot never gets permission for a node past a blocked one).
 - `TimeWindow.exit` must not precede `enter`.
 - `order_update_id` is a per-`order_id` monotonic counter; robots reject updates not greater than what they already hold (`OrderExecutor.accept_order`).
+- `State.sub_state` is non-null **iff** `state == BUSY`; `paused` and `pause_source` must be set together.
+
+**Robot status is four orthogonal axes, not one enum.** `RobotState` (IDLE/BUSY/CHARGING/ERROR/EMERGENCY) is the exclusive machine; `BusySubState` (MOVING/WAITING/ACTING) refines BUSY only; `OperatingMode` (AUTO/MANUAL) is the panel toggle; `paused` + `PauseSource` (LOCAL/FMS) is the pause gate. Collapsing them loses states that actually occur — "BUSY but paused", "IDLE but MANUAL" — and erases `WAITING`, which deadlock detection needs to distinguish blocked-on-permission from driving. `OFFLINE` is not a `RobotState`: a powered-down robot cannot publish its own death, so connectivity lives on the `connection` topic via LWT.
+
+Internally `OrderExecutor` keeps `base_state` and overlays `EMERGENCY` in the `state` property while `estop_latched` is set. E-stop and pause never mutate `base_state` or drop the order, so "release and continue" needs no save/restore — but motion resumes through `_resume_motion()`, which re-runs A* from the robot's current pose (it may have stopped mid-edge, or been driven elsewhere in MANUAL). `ERROR` is the exception: FATAL discards the order and requires the start button or `RESET_ERROR`. Same-`order_id` updates are accepted even while stopped, so FMS can still grant traffic permission to a paused robot.
 
 **Path planning moved to the robot** (architecture change from the original VDA5050-style design): an `Order` now typically carries a single destination `OrderNode`, not a pre-planned waypoint list. The robot computes the obstacle-avoiding route itself via `robot_client/planner.py` (grid A*, inflated by robot footprint), and reports the resulting route back in `State.local_path` (`list[Point]`) purely for observability — nothing consumes it as input. `State` also carries `width`/`length` (the robot's own footprint) so viewers can render it accurately without out-of-band config. `released`/traffic-control semantics on `OrderNode` are unchanged — FMS still gates which nodes a robot may pass.
 

@@ -6,7 +6,7 @@ python3 example_usage.py 로 실행하면 동작을 확인할 수 있다.
 from pydantic import ValidationError
 
 from common.schemas import (
-    Action, ActionType, BatteryInfo, Connection, ConnectionState,
+    Action, ActionType, BatteryInfo, BusySubState, Connection, ConnectionState,
     InstantAction, InstantActionType, Order, OrderNode, Pose,
     RobotState, State, TimeWindow, topic_order, topic_state,
 )
@@ -63,7 +63,8 @@ def demo_robot_reports():
         header_id=42,
         timestamp=1207.4,
         robot_id="AMR-001",
-        state=RobotState.ACTING,
+        state=RobotState.BUSY,
+        sub_state=BusySubState.ACTING,
         pose=Pose(x=18.0, y=8.0, theta=0.0),
         velocity=0.0,
         last_node_id="N18",
@@ -132,17 +133,17 @@ def demo_validation_catches_bugs():
 
 
 def demo_instant_action():
-    """[FMS] 긴급 명령 / 장애 주입"""
+    """[FMS] 원격 일시정지 / 장애 주입"""
     stop = InstantAction(
         header_id=99, timestamp=1300.0, robot_id="AMR-005",
-        action_id="IA-1", action_type=InstantActionType.EMERGENCY_STOP,
+        action_id="IA-1", action_type=InstantActionType.PAUSE,
     )
     fault = InstantAction(
         header_id=100, timestamp=1300.0, robot_id="AMR-005",
         action_id="IA-2", action_type=InstantActionType.INJECT_FAULT,
         params={"fault": "MOTOR_FAULT", "duration": 30.0},
     )
-    print(f"긴급정지: {stop.action_type.value}")
+    print(f"원격 정지: {stop.action_type.value}")
     print(f"장애주입: {fault.params}\n")
 
 

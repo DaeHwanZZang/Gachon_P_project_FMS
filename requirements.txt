@@ -11,3 +11,6 @@ Pillow>=10.0
 numpy>=1.26
 matplotlib>=3.8   # 정적 맵 확인용 구 뷰어(tools/map_viewer.py). 라이브 뷰어는 PySide6 사용
 PySide6>=6.7       # 라이브 플릿 뷰어(tools/qt_viewer.py, tools/fleet_monitor_qt.py)
+
+# macOS 메뉴바 앱 이름 표시용 (없어도 조용히 무시됨, 개발 환경이 macOS일 때만 설치)
+pyobjc-framework-Cocoa>=10.0; sys_platform == "darwin"

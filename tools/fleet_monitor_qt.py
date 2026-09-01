@@ -28,15 +28,30 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from PySide6.QtCore import QTimer  # noqa: E402
+from PySide6.QtGui import QIcon  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from common.map_model import MapModel  # noqa: E402
 from tools.fleet_monitor import FleetMonitor  # noqa: E402
-from tools.qt_viewer import FleetViewWindow  # noqa: E402
+from tools.qt_viewer import ICON_PATH, FleetViewWindow  # noqa: E402
 
 log = logging.getLogger("monitor-qt")
 
 REFRESH_PERIOD_MS = 100
+APP_NAME = "Fleet Viewer"
+
+
+def _set_macos_menu_bar_name(name: str) -> None:
+    """macOS 메뉴바(애플 로고 옆)에 뜨는 앱 이름을 바꾼다. pyobjc 없으면 조용히 넘어감."""
+    if sys.platform != "darwin":
+        return
+    try:
+        from Foundation import NSBundle
+        info = NSBundle.mainBundle().localizedInfoDictionary() or NSBundle.mainBundle().infoDictionary()
+        if info is not None:
+            info["CFBundleName"] = name
+    except Exception:
+        pass
 
 
 def main() -> int:
@@ -54,7 +69,11 @@ def main() -> int:
         datefmt="%H:%M:%S",
     )
 
+    _set_macos_menu_bar_name(APP_NAME)
     app = QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
+    if ICON_PATH.exists():
+        app.setWindowIcon(QIcon(str(ICON_PATH)))
 
     map_model = MapModel.load(args.metadata)
     window = FleetViewWindow(map_model, title=f"Fleet Viz — {map_model.metadata.name}")

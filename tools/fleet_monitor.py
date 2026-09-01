@@ -132,7 +132,7 @@ class FleetMonitor:
                     velocity=message.velocity,
                     width=message.width,
                     length=message.length,
-                    state=message.state.value,
+                    state=message.display_state,
                     battery=message.battery.charge,
                     order_id=message.order_id,
                     remaining_nodes=len(message.node_states),

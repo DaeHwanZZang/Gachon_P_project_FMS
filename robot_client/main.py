@@ -17,8 +17,10 @@ FMS 는 목적지 좌표만 오더로 내려주고, 거기까지 장애물을 �
 로봇이 이 맵으로 스스로 A* 계획을 짠다 (robot_client/planner.py).
 --map 을 안 주면 경로계획도 충돌 감지도 꺼지고 노드 사이를 직선으로만 움직인다.
 
---gui 를 주면 로컬 제어판(robot_client/gui.py)이 뜬다. 정보 표시, 목적지 이동
-명령, 강제 재위치까지 하나의 창에서 손으로 찔러볼 수 있다 — MQTT 를 안 타고
+--gui 를 주면 로컬 제어판(robot_client/gui.py)이 뜬다. 실물 로봇이 아직 없으니
+그 자리를 대신하는 개발 툴이다 — 실물 패널(start/stop/e-stop 래치/auto-manual
+토글) 재현에 더해, 정보 표시·설정 변경·목적지 이동 명령·강제 재위치까지 하나의
+창에서 손으로 찔러볼 수 있다. MQTT 를 안 타고
 같은 프로세스 안에서 커맨드 큐로 바로 꽂아 넣는다 (사람이 조작하는 로컬
 콘솔이지 FMS 가 아니다). Tk 의존성은 --gui 없이는 아예 import 되지 않으므로
 docker-compose 로 N대를 헤드리스로 띄울 때는 영향이 없다.
@@ -38,7 +40,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from common.schemas import InstantAction, Order, OrderNode, Pose  # noqa: E402
+from common.schemas import (  # noqa: E402
+    InstantAction,
+    OperatingMode,
+    Order,
+    OrderNode,
+    Pose,
+    RobotState,
+)
 from robot_client.clock import RealtimeClock, Ticker  # noqa: E402
 from robot_client.comm import RobotComm  # noqa: E402
 from robot_client.executor import OrderExecutor  # noqa: E402
@@ -78,7 +87,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 _gui_order_seq = itertools.count(1)
 
 
-def _dispatch_gui_command(executor: OrderExecutor, command: tuple) -> None:
+def _dispatch_gui_command(executor: OrderExecutor, comm: RobotComm, command: tuple) -> None:
     """GUI 스레드가 큐에 넣은 명령을 tick 루프 스레드에서 실제로 실행한다."""
     kind = command[0]
     if kind == "move":
@@ -95,6 +104,35 @@ def _dispatch_gui_command(executor: OrderExecutor, command: tuple) -> None:
     elif kind == "relocalize":
         _, x, y, theta = command
         executor.force_relocalize(x, y, theta)
+    elif kind == "press_start":
+        executor.press_start()
+    elif kind == "press_stop":
+        executor.press_stop()
+    elif kind == "estop":
+        _, latched = command
+        executor.set_estop(latched)
+    elif kind == "mode":
+        _, mode = command
+        executor.set_mode(OperatingMode(mode))
+    elif kind == "configure":
+        _, settings = command
+        if executor.state != RobotState.IDLE:
+            log.warning("[%s] 설정 변경 거절: IDLE 상태가 아님 (%s)",
+                        executor.robot_id, executor.state.value)
+            return
+        executor.robot_width = settings["robot_width"]
+        executor.robot_length = settings["robot_length"]
+        executor.kinematics.max_velocity = settings["max_velocity"]
+        executor.kinematics.max_acceleration = settings["max_acceleration"]
+        executor.kinematics.max_deceleration = settings["max_acceleration"]
+        executor.battery.max_velocity = settings["max_velocity"]
+        new_id = settings["robot_id"]
+        if new_id != executor.robot_id:
+            comm.rebind_id(new_id)
+            executor.robot_id = new_id
+        log.info("[%s] GUI 설정 변경 적용: 크기=%.2fx%.2f 최대속도=%.3f 최대가속도=%.3f",
+                  executor.robot_id, executor.robot_width, executor.robot_length,
+                  settings["max_velocity"], settings["max_acceleration"])
 
 
 def _robot_loop(
@@ -115,7 +153,7 @@ def _robot_loop(
                     command = command_queue.get_nowait()
                 except queue.Empty:
                     break
-                _dispatch_gui_command(executor, command)
+                _dispatch_gui_command(executor, comm, command)
 
             executor.tick(dt)
 

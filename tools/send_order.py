@@ -18,8 +18,9 @@ FMS 가 생기면 이 역할은 fms_server/allocator.py 로 넘어간다.
     # 마지막 노드에서 PICK 5초
     python tools/send_order.py AMR-001 --path 1.2,6 7.4,2 --action PICK:5
 
-    # 즉시 명령
-    python tools/send_order.py AMR-001 --instant EMERGENCY_STOP
+    # 즉시 명령. 물리 e-stop 은 여기 없다 — 로봇 몸체의 래치 버튼이라 원격으로
+    # 누를 수 없다. FMS 가 할 수 있는 원격 정지는 PAUSE 뿐이다
+    python tools/send_order.py AMR-001 --instant PAUSE
     python tools/send_order.py AMR-001 --instant RESUME
     python tools/send_order.py AMR-001 --instant INJECT_FAULT --fault MOTOR_FAULT
 """
@@ -107,7 +108,7 @@ def main() -> int:
     parser.add_argument("--action", metavar="TYPE[:SEC]",
                         help="마지막 노드에 붙일 액션. 예: PICK:5, DROP:3, CHARGE:20")
     parser.add_argument("--instant", metavar="TYPE",
-                        help="즉시 명령. CANCEL_ORDER / EMERGENCY_STOP / RESUME / "
+                        help="즉시 명령. CANCEL_ORDER / PAUSE / RESUME / "
                              "RESET_ERROR / INJECT_FAULT")
     parser.add_argument("--fault", default="MOTOR_FAULT",
                         help="INJECT_FAULT 일 때 주입할 장애 이름")
