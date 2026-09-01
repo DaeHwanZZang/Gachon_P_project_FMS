@@ -12,7 +12,7 @@ MQTT 구독/파싱은 `tools/fleet_monitor.py` 의 `FleetMonitor` 를 그대로 
 `set_connection()` 두 메서드만 호출한다).
 
 라이브로 보려면:
-    python tools/fleet_monitor_qt.py maps/warehouse.json
+    python tools/fleet_monitor_qt.py maps/warehouse/warehouse.json
 
 matplotlib 버전 대비 얻는 것
     - 확대/축소/이동이 Qt 기본 기능 (QGraphicsView) — 직접 짤 필요 없다

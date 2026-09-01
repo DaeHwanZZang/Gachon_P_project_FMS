@@ -5,8 +5,11 @@
 뷰어와 로봇 클라이언트를 테스트할 창고형 occupancy grid 를 만든다.
 실제 맵이 준비되기 전까지 쓰는 개발용 도구다.
 
-    python tools/make_sample_map.py                 # maps/warehouse.png + .json 생성
+    python tools/make_sample_map.py                 # maps/warehouse/warehouse.png + .json 생성
     python tools/make_sample_map.py --name test --width-m 10 --height-m 10
+
+맵 하나 = maps/ 아래 폴더 하나 (예: maps/641931de9eae7cecb34d5765/ 참고).
+--out-dir 를 생략하면 maps/<name>/ 을 자동으로 만든다.
 
 색 규칙 (common/map_model.py 와 동일)
     255 흰색  = FREE      주행 가능
@@ -82,7 +85,10 @@ def main() -> None:
                         help="좌상단 world x (m). 생략하면 맵 정중앙이 (0,0) 이 되도록 자동 계산")
     parser.add_argument("--origin-y", type=float, default=None,
                         help="좌상단 world y (m). 생략하면 맵 정중앙이 (0,0) 이 되도록 자동 계산")
-    parser.add_argument("--out-dir", default="maps", help="출력 디렉터리")
+    parser.add_argument(
+        "--out-dir", default=None,
+        help="출력 디렉터리. 생략하면 maps/<name>/ (맵 하나 = 폴더 하나 원칙)",
+    )
     args = parser.parse_args()
 
     width_px = int(round(args.width_m / args.resolution))
@@ -93,7 +99,7 @@ def main() -> None:
 
     grid = build_warehouse(width_px, height_px, args.resolution)
 
-    out_dir = Path(args.out_dir)
+    out_dir = Path(args.out_dir) if args.out_dir else Path("maps") / args.name
     out_dir.mkdir(parents=True, exist_ok=True)
     image_name = f"{args.name}.png"
     Image.fromarray(grid, mode="L").save(out_dir / image_name)

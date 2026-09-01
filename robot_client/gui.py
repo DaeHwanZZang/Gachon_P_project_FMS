@@ -28,6 +28,9 @@ Tk 는 메인 스레드에서 돌아야 안전하다(특히 macOS). 그래서 �
 중에 로봇 몸체 크기나 속도가 바뀌면 이미 계획된 경로·트래픽 통행권 전제가
 깨진다. GUI 쪽에서 IDLE 아니면 입력칸을 비활성화하고, tick 루프 쪽
 (`main.py`)에서도 다시 한번 상태를 확인한다 (레이스 방지용 이중 방어).
+
+창 내용 전체가 Canvas + Scrollbar 로 감싸인 스크롤 영역 안에 들어간다 — 창을
+줄이거나 섹션이 늘어나도 아래 내용이 잘리지 않고 스크롤로 접근할 수 있다.
 """
 
 from __future__ import annotations
@@ -48,23 +51,23 @@ REFRESH_MS = 200
 
 _ICON_PATH = Path(__file__).resolve().parent.parent / "assets" / "icons" / "robot_gui_icon.png"
 
-# -- 색 팔레트 -------------------------------------------------------------
-BG = "#1e1f26"
-PANEL_BG = "#262832"
-BORDER = "#3a3d4a"
-FG = "#e6e6ec"
-FG_DIM = "#9a9cad"
-ACCENT = "#4f8cff"
-DANGER = "#ef4d6b"
-ESTOP_IDLE = "#8f2438"
-ESTOP_ON = "#ef4d6b"
+# -- 색 팔레트 (라이트 테마) -------------------------------------------------
+BG = "#f2f3f6"
+PANEL_BG = "#ffffff"
+BORDER = "#d7dae1"
+FG = "#20222b"
+FG_DIM = "#6b7080"
+ACCENT = "#2f6fed"
+DANGER = "#d92d43"
+ESTOP_IDLE = "#c23b52"
+ESTOP_ON = "#e0263f"
 
 STATE_COLORS = {
-    RobotState.IDLE: "#7c8291",
-    RobotState.BUSY: "#4f8cff",
-    RobotState.CHARGING: "#2fb8a3",
-    RobotState.ERROR: "#ef4d6b",
-    RobotState.EMERGENCY: "#ff2d55",
+    RobotState.IDLE: "#5b6070",
+    RobotState.BUSY: "#2f6fed",
+    RobotState.CHARGING: "#0f9d84",
+    RobotState.ERROR: "#d92d43",
+    RobotState.EMERGENCY: "#e0263f",
 }
 
 
@@ -110,22 +113,22 @@ def _setup_style(root: tk.Tk) -> None:
                      font=("Helvetica", 8))
     style.configure("TEntry", fieldbackground=PANEL_BG, foreground=FG,
                      insertcolor=FG, bordercolor=BORDER)
-    style.map("TEntry", fieldbackground=[("disabled", "#1a1b21")],
+    style.map("TEntry", fieldbackground=[("disabled", "#eceef2")],
               foreground=[("disabled", FG_DIM)])
     style.configure("Accent.TButton", background=ACCENT, foreground="#ffffff",
                      font=("Helvetica", 10, "bold"), padding=6)
-    style.map("Accent.TButton", background=[("disabled", "#3a3d4a"), ("active", "#6ea1ff")],
-              foreground=[("disabled", FG_DIM)])
-    style.configure("Panel.TButton", background=BORDER, foreground=FG_DIM,
+    style.map("Accent.TButton", background=[("disabled", "#c3cad6"), ("active", "#5089f5")],
+              foreground=[("disabled", "#ffffff")])
+    style.configure("Panel.TButton", background=BORDER, foreground=FG,
                      font=("Helvetica", 10), padding=6)
-    style.map("Panel.TButton", background=[("active", "#4a4d5c")])
+    style.map("Panel.TButton", background=[("active", "#c7cbd4")])
     # e-stop 은 래치형이라 눌린 상태가 색으로 유지돼야 한다
     style.configure("Estop.TButton", background=ESTOP_IDLE, foreground="#ffffff",
                      font=("Helvetica", 11, "bold"), padding=10)
     style.map("Estop.TButton", background=[("active", "#a82c44")])
     style.configure("EstopOn.TButton", background=ESTOP_ON, foreground="#ffffff",
                      font=("Helvetica", 11, "bold"), padding=10)
-    style.map("EstopOn.TButton", background=[("active", "#ff6b83")])
+    style.map("EstopOn.TButton", background=[("active", "#f04a63")])
     style.configure("Mode.TRadiobutton", background=PANEL_BG, foreground=FG,
                      font=("Helvetica", 10))
     style.map("Mode.TRadiobutton", background=[("active", PANEL_BG)],
@@ -139,6 +142,62 @@ def _section(root: tk.Widget, text: str) -> ttk.Labelframe:
     inner = ttk.Frame(frame, style="Panel.TFrame")
     inner.pack(fill="x", padx=10, pady=8)
     return inner
+
+
+def _build_scroll_area(root: tk.Tk) -> ttk.Frame:
+    """
+    창 내용 전체를 감싸는 스크롤 영역. 섹션이 늘어나거나 창을 줄여도 아래
+    내용이 잘리지 않고 스크롤로 접근 가능하다.
+
+    Canvas 위에 내용 Frame 을 얹는 표준 Tk 패턴이다 (ttk 는 스크롤 가능한
+    컨테이너를 기본 제공하지 않는다) — Canvas 만 스크롤이 가능하므로, 실제
+    위젯들은 그 안에 올린 Frame(content) 에 담고 Canvas 는 뷰포트 역할만 한다.
+    """
+    outer = ttk.Frame(root)
+    outer.pack(fill="both", expand=True)
+
+    canvas = tk.Canvas(outer, bg=BG, highlightthickness=0, bd=0)
+    scrollbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+    canvas.configure(yscrollcommand=scrollbar.set)
+    canvas.pack(side="left", fill="both", expand=True)
+    scrollbar.pack(side="right", fill="y")
+
+    content = ttk.Frame(canvas)
+    window_id = canvas.create_window((0, 0), window=content, anchor="nw")
+
+    def _on_content_resize(_event: tk.Event) -> None:
+        canvas.configure(scrollregion=canvas.bbox("all"))
+
+    def _on_canvas_resize(event: tk.Event) -> None:
+        # content 폭을 canvas 폭에 맞춰야 안의 위젯들(fill="x")이 창 너비를 따라간다
+        canvas.itemconfigure(window_id, width=event.width)
+
+    content.bind("<Configure>", _on_content_resize)
+    canvas.bind("<Configure>", _on_canvas_resize)
+
+    def _on_mousewheel(event: tk.Event) -> None:
+        if event.num == 4:          # Linux 스크롤 업
+            canvas.yview_scroll(-1, "units")
+        elif event.num == 5:        # Linux 스크롤 다운
+            canvas.yview_scroll(1, "units")
+        else:                       # macOS/Windows
+            canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+
+    # 포인터가 창 위에 있을 때만 바인딩 — 다른 창의 스크롤을 가로채지 않는다
+    def _bind_wheel(_event: tk.Event) -> None:
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        canvas.bind_all("<Button-4>", _on_mousewheel)
+        canvas.bind_all("<Button-5>", _on_mousewheel)
+
+    def _unbind_wheel(_event: tk.Event) -> None:
+        canvas.unbind_all("<MouseWheel>")
+        canvas.unbind_all("<Button-4>")
+        canvas.unbind_all("<Button-5>")
+
+    canvas.bind("<Enter>", _bind_wheel)
+    canvas.bind("<Leave>", _unbind_wheel)
+
+    return content
 
 
 def launch_gui(
@@ -155,24 +214,26 @@ def launch_gui(
     _set_macos_menu_bar_name(f"{executor.robot_id} 제어판")
     root = tk.Tk()
     root.title(f"{executor.robot_id} 제어판")
-    root.geometry("420x960")
-    root.minsize(380, 700)
+    root.geometry("420x720")
+    root.minsize(380, 360)
     _setup_style(root)
     if _ICON_PATH.exists():
         icon = tk.PhotoImage(file=str(_ICON_PATH))
         root.iconphoto(True, icon)
         root._icon_ref = icon  # GC 방지
 
-    _, id_label, status_var, status_label = _build_header(root, executor)
-    panel = _build_panel_section(root, executor, command_queue)
-    info_vars = _build_info_section(root, executor)
+    content = _build_scroll_area(root)
+
+    _, id_label, status_var, status_label = _build_header(content, executor)
+    panel = _build_panel_section(content, executor, command_queue)
+    info_vars = _build_info_section(content, executor)
     settings = _build_settings_section(
-        root, executor, command_queue,
+        content, executor, command_queue,
         robot_width=robot_width, robot_length=robot_length,
         max_velocity=max_velocity, max_acceleration=max_acceleration,
     )
-    _build_move_section(root, command_queue)
-    _build_relocalize_section(root, command_queue)
+    _build_move_section(content, command_queue)
+    _build_relocalize_section(content, command_queue)
 
     def _refresh() -> None:
         snapshot = _update_info(info_vars, executor)
@@ -256,12 +317,6 @@ def _build_panel_section(
         button_row, text="STOP", style="Panel.TButton",
         command=lambda: command_queue.put(("press_stop",)),
     ).pack(side="left", expand=True, fill="x", padx=(4, 0))
-
-    ttk.Label(
-        frame,
-        text="START: 일시정지 걸기/풀기. ERROR 상태면 오류 해제. STOP: 기능 없음(더미)",
-        style="Hint.TLabel", wraplength=320, justify="left",
-    ).pack(fill="x", pady=(4, 0))
 
     estop = ttk.Button(frame, text="■ E-STOP", style="Estop.TButton")
     estop.configure(command=lambda: command_queue.put(("estop", not executor.estop_latched)))

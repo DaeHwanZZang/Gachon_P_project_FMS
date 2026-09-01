@@ -6,7 +6,7 @@
 `FleetMonitor` 클래스를 그대로 재사용한다 — 렌더러에 의존하지 않게 짜여
 있었기 때문에 뷰어만 matplotlib -> Qt 로 갈아끼우면 됐다).
 
-    python tools/fleet_monitor_qt.py maps/warehouse.json
+    python tools/fleet_monitor_qt.py maps/warehouse/warehouse.json
 
 조작
     드래그        화면 이동 (Qt 기본 ScrollHandDrag)

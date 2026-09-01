@@ -4,7 +4,7 @@
 
 브로커에서 로봇들의 state / connection 을 구독해 뷰어에 그린다.
 
-    python tools/fleet_monitor.py maps/warehouse.json
+    python tools/fleet_monitor.py maps/warehouse/warehouse.json
 
 **순수 관측자다.** 로봇에게 아무것도 보내지 않고, 로봇을 시뮬레이션하지도 않는다.
 화면에 보이는 모든 값은 로봇 프로세스가 스스로 보고한 것이다. 모니터를 꺼도

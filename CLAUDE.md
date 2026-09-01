@@ -98,8 +98,9 @@ project/
 │   ├── __init__.py
 │   ├── schemas.py          # ✅ FMS/로봇 공유 메시지 계약
 │   └── map_model.py        # ✅ occupancy grid 맵 + 좌표 변환
-├── maps/                   # 맵 이미지(PNG) + 메타데이터(JSON)
-│   └── 641931de9eae7cecb34d5765/  # 실제 AMR 벤더 맵 (Schaeffler 현장). 개발/테스트 기준 맵
+├── maps/                   # 맵 하나 = 폴더 하나 (원칙). 이미지(PNG) + 메타데이터(JSON) 를 같이 둔다
+│   ├── 641931de9eae7cecb34d5765/  # 실제 AMR 벤더 맵 (Schaeffler 현장). 개발/테스트 기준 맵
+│   └── warehouse/                 # 샘플 창고 맵 (make_sample_map.py 생성)
 ├── tools/                  # 개발 도구 (FMS/로봇 런타임에 포함되지 않음)
 │   ├── make_sample_map.py     # 샘플 창고 맵 생성
 │   ├── import_vendor_map.py   # ✅ 벤더 grid_cfg.grid -> MapMetadata JSON (이미지 변환 없음)
@@ -136,7 +137,10 @@ project/
 
 ## 맵 좌표계
 
-맵은 **흑백 occupancy grid PNG + 메타데이터 JSON** 한 쌍이다 (`maps/`).
+맵은 **흑백 occupancy grid PNG + 메타데이터 JSON** 한 쌍이다. **맵 하나 = `maps/` 아래
+폴더 하나** 가 원칙이다 (`maps/641931de9eae7cecb34d5765/` 처럼) — PNG 와 JSON 을
+같은 폴더에 두고, `MapMetadata.image` 필드는 그 폴더 기준 파일명만 갖는다
+(`MapModel.load` 가 메타데이터 파일과 같은 디렉터리에서 이미지를 찾는다).
 상세는 `common/map_model.py`.
 
 | 그레이 값 | 셀 | 주행 |
@@ -398,7 +402,7 @@ Python 3.11+ 필요. 프로젝트 전용 가상환경을 쓴다 (테스트 프�
 ```bash
 python3.12 -m venv .venv
 .venv/bin/pip install -r requirements.txt
-.venv/bin/python tools/make_sample_map.py       # maps/warehouse.png + .json 생성
+.venv/bin/python tools/make_sample_map.py       # maps/warehouse/warehouse.png + .json 생성
 .venv/bin/python tools/import_vendor_map.py maps/641931de9eae7cecb34d5765   # 실제 벤더 맵 임포트
 ```
 
@@ -409,14 +413,14 @@ python3.12 -m venv .venv
 mosquitto -c broker/mosquitto.conf          # macOS: brew install mosquitto
 
 # 2) 로봇 — 1대당 터미널 1개. 10대면 10번 실행
-.venv/bin/python -m robot_client.main --id AMR-001 --map maps/warehouse.json --x 1.2 --y 6.0
-.venv/bin/python -m robot_client.main --id AMR-002 --map maps/warehouse.json --x 1.2 --y 4.0
+.venv/bin/python -m robot_client.main --id AMR-001 --map maps/warehouse/warehouse.json --x 1.2 --y 6.0
+.venv/bin/python -m robot_client.main --id AMR-002 --map maps/warehouse/warehouse.json --x 1.2 --y 4.0
 # --gui 붙이면 로컬 제어판(Tk)도 같이 뜬다 — 실물 패널(start/stop/e-stop/auto-manual) 재현 포함
 # --robot-width/--robot-length 로 로봇 크기 지정 (기본 0.5x0.7m)
-.venv/bin/python -m robot_client.main --id AMR-003 --map maps/warehouse.json --x 1.2 --y 2.0 --gui
+.venv/bin/python -m robot_client.main --id AMR-003 --map maps/warehouse/warehouse.json --x 1.2 --y 2.0 --gui
 
 # 3) 뷰어 (관측 전용) — Qt 버전이 기본. matplotlib 버전은 정적 확인용으로만 남겨둠
-.venv/bin/python tools/fleet_monitor_qt.py maps/warehouse.json
+.venv/bin/python tools/fleet_monitor_qt.py maps/warehouse/warehouse.json
 
 # 4) 오더 발행 — FMS 가 생기기 전까지 쓰는 임시 도구. --path 는 이제 보통 목적지 1개만 준다
 #    (경유점을 여러 개 주면 예전처럼 그 사이 통행권 제어도 되지만, 각 구간 사이 장애물
@@ -430,7 +434,7 @@ mosquitto -c broker/mosquitto.conf          # macOS: brew install mosquitto
 
 ```bash
 .venv/bin/python example_usage.py                        # 스키마 데모
-.venv/bin/python tools/map_viewer.py maps/warehouse.json # 맵만 보는 정적 뷰어
+.venv/bin/python tools/map_viewer.py maps/warehouse/warehouse.json # 맵만 보는 정적 뷰어
 ```
 
 - 뷰어에서 **클릭하면 world 좌표가 터미널에 찍힌다.** 오더 노드 위치를 잡을 때 쓴다

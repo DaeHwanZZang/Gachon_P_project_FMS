@@ -11,9 +11,9 @@ occupancy grid 맵과 로봇들을 world 좌표계(미터) 위에 그린다.
 라이브로 보려면 `tools/fleet_monitor.py` 를 쓴다 (MQTT 구독 -> 이 뷰어).
 이 파일을 직접 실행하면 맵 확인용 정적 뷰어가 된다.
 
-    python tools/map_viewer.py maps/warehouse.json
-    python tools/map_viewer.py maps/warehouse.json --robot 1.2,6,0 --path 1.2,6 1.2,2
-    python tools/map_viewer.py maps/warehouse.json --save out.png     # 창 없이 파일로
+    python tools/map_viewer.py maps/warehouse/warehouse.json
+    python tools/map_viewer.py maps/warehouse/warehouse.json --robot 1.2,6,0 --path 1.2,6 1.2,2
+    python tools/map_viewer.py maps/warehouse/warehouse.json --save out.png     # 창 없이 파일로
 
 조작
     마우스 이동   좌표 / 셀 종류가 툴바에 표시됨
@@ -619,7 +619,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="occupancy grid 맵 뷰어 (정적). 라이브 관측은 tools/fleet_monitor.py"
     )
-    parser.add_argument("metadata", help="맵 메타데이터 JSON 경로 (예: maps/warehouse.json)")
+    parser.add_argument("metadata", help="맵 메타데이터 JSON 경로 (예: maps/warehouse/warehouse.json)")
     parser.add_argument("--robot", type=parse_pose, metavar="X,Y[,THETA]",
                         help="로봇 위치 표시 (정적). theta 는 라디안")
     parser.add_argument("--path", type=parse_xy, nargs="+", metavar="X,Y",

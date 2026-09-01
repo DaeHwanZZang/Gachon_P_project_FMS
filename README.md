@@ -57,16 +57,16 @@ mosquitto -c broker/mosquitto.conf
 ### 로봇 띄우기 (터미널을 나눠서 각각 실행)
 
 ```bash
-.venv/bin/python -m robot_client.main --id AMR-001 --map maps/warehouse.json --x 1.2 --y 6.0
+.venv/bin/python -m robot_client.main --id AMR-001 --map maps/warehouse/warehouse.json --x 1.2 --y 6.0
 
 # --gui 를 붙이면 로컬 제어판(위치 확인/이동 명령/강제 로컬라이징)도 뜬다
-.venv/bin/python -m robot_client.main --id AMR-002 --map maps/warehouse.json --x 1.2 --y 4.0 --gui
+.venv/bin/python -m robot_client.main --id AMR-002 --map maps/warehouse/warehouse.json --x 1.2 --y 4.0 --gui
 ```
 
 ### 뷰어로 관측
 
 ```bash
-.venv/bin/python tools/fleet_monitor_qt.py maps/warehouse.json
+.venv/bin/python tools/fleet_monitor_qt.py maps/warehouse/warehouse.json
 ```
 
 드래그로 이동, 스크롤로 확대/축소. `g`=격자, `t`=계획경로, `r`=보기 초기화.
